@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,15 +16,15 @@ author:     lixianmin
 要求MySQL表拥有字段：id, error_message, kind, retry, locked, update_time
 
 CREATE TABLE `notify_queue` (
-`id` bigint(11) unsigned NOT NULL AUTO_INCREMENT,
-`target_id` bigint(11) NOT NULL DEFAULT '0' COMMENT '用户id',
-`error_message` text NOT NULL COMMENT '错误消息',
-`kind` int(3) NOT NULL DEFAULT '0' COMMENT '处理类型：1 EmailLow, 2 EmailHigh, 3 SmsLow, 4 SmsHigh',
-`retry` int(3) NOT NULL DEFAULT '0' COMMENT '尝试发送次数，含首次发送。如果retry=0则不发送，如果retry=1则只发送一次',
-`locked` int(2) NOT NULL DEFAULT '0' COMMENT '是否被锁定',
-`create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-`update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-PRIMARY KEY (`id`)
+  `id` bigint(11) unsigned NOT NULL AUTO_INCREMENT,
+  `target_id` bigint(11) NOT NULL DEFAULT '0' COMMENT '目标表的row_id',
+  `kind` int(3) NOT NULL DEFAULT '0' COMMENT '处理类型：1 EmailLow, 2 EmailHigh, 3 SmsLow, 4 SmsHigh',
+  `retry` int(3) NOT NULL DEFAULT '1' COMMENT '尝试发送次数，含首次发送。如果retry=0则不发送，如果retry=1则只发送一次',
+  `locked` int(2) NOT NULL DEFAULT '0' COMMENT '是否被锁定',
+  `error_message` varchar(512) NOT NULL COMMENT '错误消息',
+  `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `update_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='消息队列';
 
 Copyright (C) - All Rights Reserved
@@ -35,6 +36,7 @@ type MySQLQueue struct {
 
 	selectForLock string
 	updateForLock string
+	extendLife    string
 	unlockExpires string
 	deleteRow     string
 	unlockRow     string
@@ -47,6 +49,7 @@ type MySQLQueue struct {
 // args			默认参数，如果不传，则有默认值
 func NewMySQLQueue(db *sql.DB, tableName string, kind int, listener IRowListener, args *MySQLQueueArgs) *MySQLQueue {
 	if db == nil || tableName == "" || listener == nil {
+		logger.Error("invalid argument, db=%v, tableName=%q, listener=%v", db, tableName, listener)
 		return nil
 	}
 
@@ -60,9 +63,10 @@ func NewMySQLQueue(db *sql.DB, tableName string, kind int, listener IRowListener
 		db:   db,
 		args: args,
 
-		selectForLock: fmt.Sprintf("select id from %s where locked = 0 and kind=%d and retry > 0 and now() > update_time limit %d for update;", tableName, kind, concurrency),
-		updateForLock: fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where kind=%d and id in (?);", tableName, kind),
-		unlockExpires: fmt.Sprintf("update %s set locked = 0 where locked = 1 and kind=%d and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, kind),
+		selectForLock: fmt.Sprintf("select id from %s where locked = 0 and kind = %d and retry > 0 and now() > update_time limit %d for update;", tableName, kind, concurrency),
+		updateForLock: fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where kind = %d and id in (%%s);", tableName, kind),
+		extendLife:    fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
+		unlockExpires: fmt.Sprintf("update %s set locked = 0 where locked = 1 and kind = %d and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, kind),
 		deleteRow:     fmt.Sprintf("delete from %s where id = ?;", tableName),
 
 		// 解锁的时候，利用 update_time 把重试时间设置到 ? seconds 之后
@@ -72,25 +76,29 @@ func NewMySQLQueue(db *sql.DB, tableName string, kind int, listener IRowListener
 	}
 
 	var rowsChan = make(chan int64, concurrency)
+	var processingRows = &sync.Map{}
 	var retryCountMap = &sync.Map{}
 
 	// 主循环
-	go mq.goLoop(tableName, kind, rowsChan)
+	go mq.goLoop(tableName, kind, rowsChan, processingRows)
 
 	// concurrency个任务处理协程
 	for i := 0; i < concurrency; i++ {
-		go mq.goProcess(listener, rowsChan, retryCountMap)
+		go mq.goProcess(listener, rowsChan, processingRows, retryCountMap)
 	}
 
 	return mq
 }
 
-func (mq *MySQLQueue) goLoop(tableName string, kind int, rowsChan chan int64) {
+func (mq *MySQLQueue) goLoop(tableName string, kind int, rowsChan chan int64, processingRows *sync.Map) {
 	var lockTicker = time.NewTicker(500 * time.Millisecond)
-	var unlockTicker = time.NewTicker(5 * time.Minute)
+	var unlockTicker = time.NewTicker(2 * time.Minute)
+	var extendLifeTicker = time.NewTicker(30 * time.Second)
+
 	defer func() {
 		lockTicker.Stop()
 		unlockTicker.Stop()
+		extendLifeTicker.Stop()
 	}()
 
 	for {
@@ -99,25 +107,38 @@ func (mq *MySQLQueue) goLoop(tableName string, kind int, rowsChan chan int64) {
 			var rows, err = mq.lockForProcess()
 			if err == nil {
 				for i := 0; i < len(rows); i++ {
-					var rowId = rows[i]
+					var rowId = rows[i].(int64)
 					rowsChan <- rowId
 				}
 			} else {
 				logger.Error(err)
 			}
 		case <-unlockTicker.C:
+			// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
 			if _, err := mq.db.Exec(mq.unlockExpires); err != nil {
 				logger.Error(err)
 			}
+		case <-extendLifeTicker.C:
+			// 正在处理中的rows，每隔一段时间将拿到的锁续命一下，防止被unlockTicker强制解锁
+			processingRows.Range(func(key, value interface{}) bool {
+				var rowId = key.(int64)
+				if _, err := mq.db.Exec(mq.extendLife, rowId); err != nil {
+					logger.Error(err)
+				}
+
+				return true
+			})
 		}
 	}
 }
 
-func (mq *MySQLQueue) goProcess(listener IRowListener, rowsChan chan int64, retryCountMap *sync.Map) {
+func (mq *MySQLQueue) goProcess(listener IRowListener, rowsChan chan int64, processingRows *sync.Map, retryCountMap *sync.Map) {
 	for {
 		select {
 		case rowId := <-rowsChan:
-			var action = listener.consume(rowId)
+			processingRows.Store(rowId, nil)
+			var action = listener.Consume(rowId)
+			processingRows.Delete(rowId)
 
 			switch action {
 			case CommitMessage:
@@ -141,13 +162,14 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	var retryCount = lastRetryCount.(int) + 1
 	retryCountMap.Store(rowId, retryCount)
 
+	// 计算下一次重试的间隔时间
 	var retrySeconds = mq.args.nextRetrySeconds(retryCount)
 	if _, err := mq.db.Exec(mq.unlockRow, retrySeconds, rowId); err != nil {
 		logger.Error(err)
 	}
 }
 
-func (mq *MySQLQueue) lockForProcess() ([]int64, error) {
+func (mq *MySQLQueue) lockForProcess() ([]interface{}, error) {
 	var tx, err = mq.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
@@ -163,7 +185,7 @@ func (mq *MySQLQueue) lockForProcess() ([]int64, error) {
 	defer rows.Close()
 
 	// 循环获取rowIds
-	var rowIds []int64
+	var rowIds []interface{}
 	for rows.Next() {
 		var rowId int64
 		if err := rows.Scan(&rowId); err != nil {
@@ -172,10 +194,28 @@ func (mq *MySQLQueue) lockForProcess() ([]int64, error) {
 		rowIds = append(rowIds, rowId)
 	}
 
-	_, err = tx.Exec(mq.updateForLock, rows)
+	if len(rowIds) == 0 {
+		return rowIds, nil
+	}
+
+	var query = fmt.Sprintf(mq.updateForLock, placeholders(len(rowIds)))
+	_, err = tx.Exec(query, rowIds...)
 	if err != nil {
 		return nil, err
 	}
 
 	return rowIds, tx.Commit()
+}
+
+func placeholders(n int) string {
+	var b strings.Builder
+	for i := 0; i < n-1; i++ {
+		b.WriteString("?,")
+	}
+
+	if n > 0 {
+		b.WriteString("?")
+	}
+
+	return b.String()
 }

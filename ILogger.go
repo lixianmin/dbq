@@ -39,6 +39,7 @@ func (l *ConsoleLogger) Error(first interface{}, args ...interface{}) {
 
 func writeMessage(fout *os.File, text string) {
 	_, _ = fout.WriteString(text)
+	_, _ = fout.WriteString("\n")
 }
 
 func formatLog(first interface{}, args ...interface{}) string {

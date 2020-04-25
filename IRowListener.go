@@ -8,5 +8,5 @@ Copyright (C) - All Rights Reserved
  *********************************************************************/
 
 type IRowListener interface {
-	consume(rowId int64) int
+	Consume(rowId int64) int
 }
