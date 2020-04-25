@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/jmoiron/sqlx"
 	"sync"
 	"time"
 )
@@ -31,7 +30,7 @@ Copyright (C) - All Rights Reserved
  *********************************************************************/
 
 type MySQLQueue struct {
-	db   *sqlx.DB // 数据库连接
+	db   *sql.DB // 数据库连接
 	args *MySQLQueueArgs
 
 	selectForLock string
@@ -46,7 +45,7 @@ type MySQLQueue struct {
 // kind int     每一个kind对应一种listener对象，拥有单独的concurrency个处理协程
 // listener     消息处理器
 // args			默认参数，如果不传，则有默认值
-func NewMySQLQueue(db *sqlx.DB, tableName string, kind int, listener IRowListener, args *MySQLQueueArgs) *MySQLQueue {
+func NewMySQLQueue(db *sql.DB, tableName string, kind int, listener IRowListener, args *MySQLQueueArgs) *MySQLQueue {
 	if db == nil || tableName == "" || listener == nil {
 		return nil
 	}
@@ -149,17 +148,28 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 }
 
 func (mq *MySQLQueue) lockForProcess() ([]int64, error) {
-	var tx, err = mq.db.BeginTxx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	var tx, err = mq.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 
 	defer tx.Rollback()
 
-	var rows []int64
-	err = tx.Select(&rows, mq.selectForLock)
-	if err != nil || len(rows) == 0 {
+	rows, err := tx.Query(mq.selectForLock)
+	if err != nil {
 		return nil, err
+	}
+
+	defer rows.Close()
+
+	// 循环获取rowIds
+	var rowIds []int64
+	for rows.Next() {
+		var rowId int64
+		if err := rows.Scan(&rowId); err != nil {
+			return nil, err
+		}
+		rowIds = append(rowIds, rowId)
 	}
 
 	_, err = tx.Exec(mq.updateForLock, rows)
@@ -167,5 +177,5 @@ func (mq *MySQLQueue) lockForProcess() ([]int64, error) {
 		return nil, err
 	}
 
-	return rows, tx.Commit()
+	return rowIds, tx.Commit()
 }
