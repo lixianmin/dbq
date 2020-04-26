@@ -58,7 +58,7 @@ func NewMySQLQueue(db *sql.DB, tableName string, kind int, listener IRowListener
 	}
 	args.checkFillDefaultArgs()
 
-	var concurrency = args.concurrency
+	var concurrency = args.Concurrency
 	var mq = &MySQLQueue{
 		db:   db,
 		args: args,
@@ -163,7 +163,7 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	retryCountMap.Store(rowId, retryCount)
 
 	// 计算下一次重试的间隔时间
-	var retrySeconds = mq.args.nextRetrySeconds(retryCount)
+	var retrySeconds = mq.args.NextRetrySeconds(retryCount)
 	if _, err := mq.db.Exec(mq.unlockRow, retrySeconds, rowId); err != nil {
 		logger.Error(err)
 	}

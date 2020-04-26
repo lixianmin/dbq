@@ -13,6 +13,8 @@ func init() {
 
 }
 
-func SetLogger(log ILogger) {
-	logger = log
+func Init(log ILogger) {
+	if log != nil {
+		logger = log
+	}
 }
