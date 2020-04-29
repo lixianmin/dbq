@@ -118,8 +118,8 @@ func (mq *MySQLQueue) goLoop(tableName string, rowsChan chan rowItem, processing
 	for {
 		select {
 		case <-lockTicker.C:
-			rowItems = rowItems[:0] // 每次需要重置rowItems与rowIds
-			var err = mq.lockForProcess(rowItems, rowIds[:0])
+			// 每次都要重置rowItems与rowIds
+			rowItems, err := mq.lockForProcess(rowItems[:0], rowIds[:0])
 			if err == nil {
 				for i := 0; i < len(rowItems); i++ {
 					rowsChan <- rowItems[i]
@@ -190,17 +190,17 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	}
 }
 
-func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) error {
+func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) ([]rowItem, error) {
 	var tx, err = mq.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	defer tx.Rollback()
 
 	rows, err := tx.Query(mq.selectForLock)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	defer rows.Close()
@@ -210,7 +210,7 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) e
 		var id int64
 		var kind int
 		if err := rows.Scan(&id, &kind); err != nil {
-			return err
+			return nil, err
 		}
 
 		rowItems = append(rowItems, rowItem{id: id, kind: kind})
@@ -219,16 +219,16 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) e
 
 	if len(rowItems) == 0 {
 		// 走这里会rollback， 逻辑没问题
-		return nil
+		return rowItems, nil
 	}
 
 	var query = fmt.Sprintf(mq.updateForLock, placeholders(len(rowIds)))
 	_, err = tx.Exec(query, rowIds...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return tx.Commit()
+	return rowItems, tx.Commit()
 }
 
 func placeholders(n int) string {
