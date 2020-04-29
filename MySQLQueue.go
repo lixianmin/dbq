@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,14 +43,22 @@ type MySQLQueue struct {
 	unlockRow     string
 }
 
+// 用于锁定行行数据
+type rowItem struct {
+	id   int64
+	kind int
+}
+
+// map<kind, listener> 消息处理器map，每一个kind对应一种listener对象
+type KindListeners map[int]IRowListener
+
 // db			数据库连接
 // tableName 	数据库表名
-// kind int     每一个kind对应一种listener对象，拥有单独的concurrency个处理协程
-// listener     消息处理器
+// listeners    消息处理器map
 // args			默认参数，如果不传，则有默认值
-func NewMySQLQueue(db *sql.DB, tableName string, kind int, listener IRowListener, args *MySQLQueueArgs) *MySQLQueue {
-	if db == nil || tableName == "" || listener == nil {
-		logger.Error("invalid argument, db=%v, tableName=%q, listener=%v", db, tableName, listener)
+func NewMySQLQueue(db *sql.DB, tableName string, listeners KindListeners, args *MySQLQueueArgs) *MySQLQueue {
+	if db == nil || tableName == "" || len(listeners) == 0 {
+		logger.Error("invalid argument, db=%v, tableName=%q, listeners=%v", db, tableName, listeners)
 		return nil
 	}
 
@@ -58,15 +67,16 @@ func NewMySQLQueue(db *sql.DB, tableName string, kind int, listener IRowListener
 	}
 	args.checkFillDefaultArgs()
 
+	var kindString = fetchKindString(listeners)
 	var concurrency = args.Concurrency
 	var mq = &MySQLQueue{
 		db:   db,
 		args: args,
 
-		selectForLock: fmt.Sprintf("select id from %s where locked = 0 and kind = %d and retry > 0 and now() > update_time limit %d for update;", tableName, kind, concurrency),
-		updateForLock: fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where kind = %d and id in (%%s);", tableName, kind),
+		selectForLock: fmt.Sprintf("select id, kind from %s where locked = 0 and kind in (%s) and retry > 0 and now() > update_time limit %d for update;", tableName, kindString, concurrency),
+		updateForLock: fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where id in (%%s);", tableName),
 		extendLife:    fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
-		unlockExpires: fmt.Sprintf("update %s set locked = 0 where locked = 1 and kind = %d and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, kind),
+		unlockExpires: fmt.Sprintf("update %s set locked = 0 where locked = 1 and kind in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, kindString),
 		deleteRow:     fmt.Sprintf("delete from %s where id = ?;", tableName),
 
 		// 解锁的时候，利用 update_time 把重试时间设置到 ? seconds 之后
@@ -75,22 +85,22 @@ func NewMySQLQueue(db *sql.DB, tableName string, kind int, listener IRowListener
 		unlockRow: fmt.Sprintf("update %s set locked = 0, update_time = date_add(now(), interval ? second) where id = ?;", tableName),
 	}
 
-	var rowsChan = make(chan int64, concurrency)
+	var rowsChan = make(chan rowItem, concurrency)
 	var processingRows = &sync.Map{}
 	var retryCountMap = &sync.Map{}
 
 	// 主循环
-	go mq.goLoop(tableName, kind, rowsChan, processingRows)
+	go mq.goLoop(tableName, rowsChan, processingRows)
 
 	// concurrency个任务处理协程
 	for i := 0; i < concurrency; i++ {
-		go mq.goProcess(listener, rowsChan, processingRows, retryCountMap)
+		go mq.goProcess(listeners, rowsChan, processingRows, retryCountMap)
 	}
 
 	return mq
 }
 
-func (mq *MySQLQueue) goLoop(tableName string, kind int, rowsChan chan int64, processingRows *sync.Map) {
+func (mq *MySQLQueue) goLoop(tableName string, rowsChan chan rowItem, processingRows *sync.Map) {
 	var lockTicker = time.NewTicker(500 * time.Millisecond)
 	var unlockTicker = time.NewTicker(2 * time.Minute)
 	var extendLifeTicker = time.NewTicker(30 * time.Second)
@@ -101,14 +111,18 @@ func (mq *MySQLQueue) goLoop(tableName string, kind int, rowsChan chan int64, pr
 		extendLifeTicker.Stop()
 	}()
 
+	var concurrency = cap(rowsChan)
+	var rowItems = make([]rowItem, 0, concurrency)
+	var rowIds = make([]interface{}, 0, concurrency)
+
 	for {
 		select {
 		case <-lockTicker.C:
-			var rows, err = mq.lockForProcess()
+			rowItems = rowItems[:0] // 每次需要重置rowItems与rowIds
+			var err = mq.lockForProcess(rowItems, rowIds[:0])
 			if err == nil {
-				for i := 0; i < len(rows); i++ {
-					var rowId = rows[i].(int64)
-					rowsChan <- rowId
+				for i := 0; i < len(rowItems); i++ {
+					rowsChan <- rowItems[i]
 				}
 			} else {
 				logger.Error(err)
@@ -132,10 +146,17 @@ func (mq *MySQLQueue) goLoop(tableName string, kind int, rowsChan chan int64, pr
 	}
 }
 
-func (mq *MySQLQueue) goProcess(listener IRowListener, rowsChan chan int64, processingRows *sync.Map, retryCountMap *sync.Map) {
+func (mq *MySQLQueue) goProcess(listeners KindListeners, rowsChan chan rowItem, processingRows *sync.Map, retryCountMap *sync.Map) {
 	for {
 		select {
-		case rowId := <-rowsChan:
+		case row := <-rowsChan:
+			var listener, ok = listeners[row.kind]
+			if !ok {
+				logger.Warn("can not find listener for row=%v", row)
+				continue
+			}
+
+			var rowId = row.id
 			processingRows.Store(rowId, nil)
 			var action = listener.Consume(rowId)
 			processingRows.Delete(rowId)
@@ -169,42 +190,45 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	}
 }
 
-func (mq *MySQLQueue) lockForProcess() ([]interface{}, error) {
+func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) error {
 	var tx, err = mq.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	defer tx.Rollback()
 
 	rows, err := tx.Query(mq.selectForLock)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	defer rows.Close()
 
-	// 循环获取rowIds
-	var rowIds []interface{}
+	// 循环获取id和kind
 	for rows.Next() {
-		var rowId int64
-		if err := rows.Scan(&rowId); err != nil {
-			return nil, err
+		var id int64
+		var kind int
+		if err := rows.Scan(&id, &kind); err != nil {
+			return err
 		}
-		rowIds = append(rowIds, rowId)
+
+		rowItems = append(rowItems, rowItem{id: id, kind: kind})
+		rowIds = append(rowIds, id)
 	}
 
-	if len(rowIds) == 0 {
-		return rowIds, nil
+	if len(rowItems) == 0 {
+		// 走这里会rollback， 逻辑没问题
+		return nil
 	}
 
 	var query = fmt.Sprintf(mq.updateForLock, placeholders(len(rowIds)))
 	_, err = tx.Exec(query, rowIds...)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return rowIds, tx.Commit()
+	return tx.Commit()
 }
 
 func placeholders(n int) string {
@@ -218,4 +242,15 @@ func placeholders(n int) string {
 	}
 
 	return b.String()
+}
+
+func fetchKindString(listeners map[int]IRowListener) string {
+	var kinds = make([]string, 0, len(listeners))
+	for i := range listeners {
+		var s = strconv.Itoa(i)
+		kinds = append(kinds, s)
+	}
+
+	var text = strings.Join(kinds, ",")
+	return text
 }
