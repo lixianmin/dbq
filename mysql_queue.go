@@ -14,12 +14,12 @@ import (
 created:    2019-11-08
 author:     lixianmin
 
-要求MySQL表拥有字段：id, error_message, kind, retry, locked, update_time
+要求MySQL表拥有字段：id, topic, retry, locked, error_message, update_time
 
 CREATE TABLE `notify_queue` (
   `id` bigint(11) unsigned NOT NULL AUTO_INCREMENT,
   `target_id` bigint(11) NOT NULL DEFAULT '0' COMMENT '目标表的row_id',
-  `kind` int(3) NOT NULL DEFAULT '0' COMMENT '处理类型：1 EmailLow, 2 EmailHigh, 3 SmsLow, 4 SmsHigh',
+  `topic` int(3) NOT NULL DEFAULT '0' COMMENT '消息队列主题：1 EmailLow, 2 EmailHigh, 3 SmsLow, 4 SmsHigh',
   `retry` int(3) NOT NULL DEFAULT '1' COMMENT '尝试发送次数，含首次发送。如果retry=0则不发送，如果retry=1则只发送一次',
   `locked` int(2) NOT NULL DEFAULT '0' COMMENT '是否被锁定',
   `error_message` varchar(512) NOT NULL COMMENT '错误消息',
@@ -45,18 +45,18 @@ type MySQLQueue struct {
 
 // 用于锁定行行数据
 type rowItem struct {
-	id   int64
-	kind int
+	id    int64
+	topic int
 }
 
-// map<kind, listener> 消息处理器map，每一个kind对应一种listener对象
-type KindListeners map[int]IRowListener
+// map<topic, listener> 消息处理器map，每一个topic对应一种listener对象
+type RowListeners map[int]IRowListener
 
 // db			数据库连接
 // tableName 	数据库表名
 // listeners    消息处理器map
 // args			默认参数，如果不传，则有默认值
-func NewMySQLQueue(db *sql.DB, tableName string, listeners KindListeners, args *MySQLQueueArgs) *MySQLQueue {
+func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *MySQLQueueArgs) *MySQLQueue {
 	if db == nil || tableName == "" || len(listeners) == 0 {
 		logger.Error("invalid argument, db=%v, tableName=%q, listeners=%v", db, tableName, listeners)
 		return nil
@@ -67,16 +67,16 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners KindListeners, args *
 	}
 	args.checkFillDefaultArgs()
 
-	var kindString = fetchKindString(listeners)
+	var topicString = fetchTopicString(listeners)
 	var concurrency = args.Concurrency
 	var mq = &MySQLQueue{
 		db:   db,
 		args: args,
 
-		selectForLock: fmt.Sprintf("select id, kind from %s where locked = 0 and kind in (%s) and retry > 0 and now() > update_time limit %d for update;", tableName, kindString, concurrency),
+		selectForLock: fmt.Sprintf("select id, topic from %s where locked = 0 and topic in (%s) and retry > 0 and now() > update_time limit %d for update;", tableName, topicString, concurrency),
 		updateForLock: fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where id in (%%s);", tableName),
 		extendLife:    fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
-		unlockExpires: fmt.Sprintf("update %s set locked = 0 where locked = 1 and kind in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, kindString),
+		unlockExpires: fmt.Sprintf("update %s set locked = 0 where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, topicString),
 		deleteRow:     fmt.Sprintf("delete from %s where id = ?;", tableName),
 
 		// 解锁的时候，利用 update_time 把重试时间设置到 ? seconds 之后
@@ -146,11 +146,11 @@ func (mq *MySQLQueue) goLoop(tableName string, rowsChan chan rowItem, processing
 	}
 }
 
-func (mq *MySQLQueue) goProcess(listeners KindListeners, rowsChan chan rowItem, processingRows *sync.Map, retryCountMap *sync.Map) {
+func (mq *MySQLQueue) goProcess(listeners RowListeners, rowsChan chan rowItem, processingRows *sync.Map, retryCountMap *sync.Map) {
 	for {
 		select {
 		case row := <-rowsChan:
-			var listener, ok = listeners[row.kind]
+			var listener, ok = listeners[row.topic]
 			if !ok {
 				logger.Warn("can not find listener for row=%v", row)
 				continue
@@ -208,12 +208,12 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 	// 循环获取id和kind
 	for rows.Next() {
 		var id int64
-		var kind int
-		if err := rows.Scan(&id, &kind); err != nil {
+		var topic int
+		if err := rows.Scan(&id, &topic); err != nil {
 			return nil, err
 		}
 
-		rowItems = append(rowItems, rowItem{id: id, kind: kind})
+		rowItems = append(rowItems, rowItem{id: id, topic: topic})
 		rowIds = append(rowIds, id)
 	}
 
@@ -244,13 +244,13 @@ func placeholders(n int) string {
 	return b.String()
 }
 
-func fetchKindString(listeners map[int]IRowListener) string {
-	var kinds = make([]string, 0, len(listeners))
+func fetchTopicString(listeners map[int]IRowListener) string {
+	var topics = make([]string, 0, len(listeners))
 	for i := range listeners {
 		var s = strconv.Itoa(i)
-		kinds = append(kinds, s)
+		topics = append(topics, s)
 	}
 
-	var text = strings.Join(kinds, ",")
+	var text = strings.Join(topics, ",")
 	return text
 }
