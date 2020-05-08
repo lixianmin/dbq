@@ -205,7 +205,7 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 
 	defer rows.Close()
 
-	// 循环获取id和kind
+	// 循环获取id和topic
 	for rows.Next() {
 		var id int64
 		var topic int
