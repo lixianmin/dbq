@@ -35,12 +35,12 @@ type MySQLQueue struct {
 	db   *sql.DB // 数据库连接
 	args *MySQLQueueArgs
 
-	selectForLock string
-	updateForLock string
-	extendLife    string
-	unlockExpires string
-	deleteRow     string
-	unlockRow     string
+	selectForLock  string
+	updateForLock  string
+	extendLife     string
+	unlockTimeouts string
+	deleteRow      string
+	unlockRow      string
 }
 
 // 用于锁定行行数据
@@ -73,11 +73,11 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 		db:   db,
 		args: args,
 
-		selectForLock: fmt.Sprintf("select id, topic from %s where locked = 0 and topic in (%s) and retry > 0 and now() > update_time limit %d for update;", tableName, topicString, concurrency),
-		updateForLock: fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where id in (%%s);", tableName),
-		extendLife:    fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
-		unlockExpires: fmt.Sprintf("update %s set locked = 0 where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, topicString),
-		deleteRow:     fmt.Sprintf("delete from %s where id = ?;", tableName),
+		selectForLock:  fmt.Sprintf("select id, topic from %s where locked = 0 and topic in (%s) and retry > 0 and now() > update_time limit %d for update;", tableName, topicString, concurrency),
+		updateForLock:  fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where id in (%%s);", tableName),
+		extendLife:     fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
+		unlockTimeouts: fmt.Sprintf("update %s set locked = 0 where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, topicString),
+		deleteRow:      fmt.Sprintf("delete from %s where id = ?;", tableName),
 
 		// 解锁的时候，利用 update_time 把重试时间设置到 ? seconds 之后
 		// 注意：设置了 update_time，不代表一定会重试处理，后者取决于retry字段是否 > 0 。比如retry=3，则nextRetrySeconds()方法最多会被调用3次，
@@ -90,7 +90,7 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 	var retryCountMap = &sync.Map{}
 
 	// 主循环
-	go mq.goLoop(tableName, rowsChan, processingRows)
+	go mq.goLoop(tableName, args, rowsChan, processingRows)
 
 	// concurrency个任务处理协程
 	for i := 0; i < concurrency; i++ {
@@ -100,14 +100,15 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 	return mq
 }
 
-func (mq *MySQLQueue) goLoop(tableName string, rowsChan chan rowItem, processingRows *sync.Map) {
-	var lockTicker = time.NewTicker(500 * time.Millisecond)
-	var unlockTicker = time.NewTicker(2 * time.Minute)
-	var extendLifeTicker = time.NewTicker(30 * time.Second)
+func (mq *MySQLQueue) goLoop(tableName string, args *MySQLQueueArgs, rowsChan chan rowItem, processingRows *sync.Map) {
+	var pollTicker = time.NewTicker(args.PollInterval)
+	var timeoutTicker = time.NewTicker(args.LockTimeout)
+	// 续命的时间间隔，需要小于超时的时间间隔
+	var extendLifeTicker = time.NewTicker(args.LockTimeout / 2)
 
 	defer func() {
-		lockTicker.Stop()
-		unlockTicker.Stop()
+		pollTicker.Stop()
+		timeoutTicker.Stop()
 		extendLifeTicker.Stop()
 	}()
 
@@ -117,7 +118,7 @@ func (mq *MySQLQueue) goLoop(tableName string, rowsChan chan rowItem, processing
 
 	for {
 		select {
-		case <-lockTicker.C:
+		case <-pollTicker.C:
 			// 每次都要重置rowItems与rowIds
 			rowItems, err := mq.lockForProcess(rowItems[:0], rowIds[:0])
 			if err == nil {
@@ -127,9 +128,9 @@ func (mq *MySQLQueue) goLoop(tableName string, rowsChan chan rowItem, processing
 			} else {
 				logger.Error(err)
 			}
-		case <-unlockTicker.C:
+		case <-timeoutTicker.C:
 			// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
-			if _, err := mq.db.Exec(mq.unlockExpires); err != nil {
+			if _, err := mq.db.Exec(mq.unlockTimeouts); err != nil {
 				logger.Error(err)
 			}
 		case <-extendLifeTicker.C:
@@ -184,7 +185,8 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	retryCountMap.Store(rowId, retryCount)
 
 	// 计算下一次重试的间隔时间
-	var retrySeconds = mq.args.NextRetrySeconds(retryCount)
+	var retryInterval = mq.args.RetryInterval(retryCount)
+	var retrySeconds = int64(retryInterval / time.Second)
 	if _, err := mq.db.Exec(mq.unlockRow, retrySeconds, rowId); err != nil {
 		logger.Error(err)
 	}

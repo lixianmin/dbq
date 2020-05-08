@@ -1,5 +1,7 @@
 package dbq
 
+import "time"
+
 /********************************************************************
 created:    2020-04-25
 author:     lixianmin
@@ -8,8 +10,10 @@ Copyright (C) - All Rights Reserved
  *********************************************************************/
 
 type MySQLQueueArgs struct {
-	Concurrency      int
-	NextRetrySeconds func(retryCount int) int
+	Concurrency   int                                // 协程并发数，默认10
+	PollInterval  time.Duration                      // 轮询新消息的时间间隔
+	LockTimeout   time.Duration                      // 锁定超时后，将强制解锁
+	RetryInterval func(retryCount int) time.Duration // 下一次重试的间隔时间，默认每次间隔60秒
 }
 
 func (args *MySQLQueueArgs) checkFillDefaultArgs() {
@@ -19,11 +23,21 @@ func (args *MySQLQueueArgs) checkFillDefaultArgs() {
 		args.Concurrency = 10
 	}
 
-	// retryCount是指第几次重试，比如 nextRetryInterval(1)，意味着已经处理过1次，但是失败了，这是第1次重试
+	// 轮询新消息的时间间隔
+	if args.PollInterval <= 0 {
+		args.PollInterval = 500 * time.Millisecond
+	}
+
+	// 锁定超时后，将强制解锁
+	if args.LockTimeout <= 0 {
+		args.LockTimeout = 2 * time.Minute
+	}
+
+	// retryCount是指第几次重试，比如 RetryInterval(1)，意味着已经处理过1次，但是失败了，这是第1次重试
 	// 默认的重试间隔为60秒
-	if args.NextRetrySeconds == nil {
-		args.NextRetrySeconds = func(retryCount int) int {
-			return 60
+	if args.RetryInterval == nil {
+		args.RetryInterval = func(retryCount int) time.Duration {
+			return 60 * time.Second
 		}
 	}
 }
