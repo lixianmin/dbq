@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -159,7 +160,7 @@ func (mq *MySQLQueue) goProcess(listeners RowListeners, rowsChan chan rowItem, p
 
 			var rowId = row.id
 			processingRows.Store(rowId, nil)
-			var action = listener.Consume(rowId)
+			var action = safeConsume(listener, rowId)
 			processingRows.Delete(rowId)
 
 			switch action {
@@ -170,6 +171,16 @@ func (mq *MySQLQueue) goProcess(listeners RowListeners, rowsChan chan rowItem, p
 			}
 		}
 	}
+}
+
+func safeConsume(listener IRowListener, rowId int64) int {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("panic - %v \n%s", rec, debug.Stack())
+		}
+	}()
+
+	return listener.Consume(rowId)
 }
 
 func (mq *MySQLQueue) onDeleteRow(rowId int64, retryCountMap *sync.Map) {
