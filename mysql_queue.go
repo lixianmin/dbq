@@ -184,7 +184,8 @@ func (mq *MySQLQueue) onDeleteRow(rowId int64, retryCountMap *sync.Map) {
 	defer cancel()
 
 	if _, err := mq.db.ExecContext(ctx, mq.deleteRow, rowId); err != nil {
-		logger.Error(err)
+		var text = fmt.Sprintf("err=%q, query=%q", err, mq.deleteRow)
+		logger.Error(text)
 	}
 }
 
@@ -201,7 +202,8 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	defer cancel()
 
 	if _, err := mq.db.ExecContext(ctx, mq.unlockRow, retrySeconds, rowId); err != nil {
-		logger.Error(err)
+		var text = fmt.Sprintf("err=%q, query=%q", err, mq.unlockRow)
+		logger.Error(text)
 	}
 }
 
@@ -211,14 +213,14 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 
 	var tx, err = mq.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("err=%q, detail=\"mq.db.BeginTx()\"", err)
 	}
 
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx, mq.selectForLock)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("err=%q, query=%q", err, mq.selectForLock)
 	}
 
 	defer rows.Close()
@@ -243,7 +245,7 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 	var query = fmt.Sprintf(mq.updateForLock, placeholders(len(rowIds)))
 	_, err = tx.ExecContext(ctx, query, rowIds...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("err=%q, query=%q", err, mq.updateForLock)
 	}
 
 	return rowItems, tx.Commit()
@@ -255,7 +257,8 @@ func (mq *MySQLQueue) onUnlockTimeouts() {
 
 	// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
 	if _, err := mq.db.ExecContext(ctx, mq.unlockTimeouts); err != nil {
-		logger.Error(err)
+		var text = fmt.Sprintf("err=%q, query=%q", err, mq.unlockTimeouts)
+		logger.Error(text)
 	}
 }
 
@@ -264,7 +267,8 @@ func (mq *MySQLQueue) onExtendLife(rowId int64) {
 	defer cancel()
 
 	if _, err := mq.db.ExecContext(ctx, mq.extendLife, rowId); err != nil {
-		logger.Error(err)
+		var text = fmt.Sprintf("err=%q, query=%q", err, mq.extendLife)
+		logger.Error(text)
 	}
 }
 
