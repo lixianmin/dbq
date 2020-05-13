@@ -130,18 +130,12 @@ func (mq *MySQLQueue) goLoop(tableName string, args *MySQLQueueArgs, rowsChan ch
 				logger.Error(err)
 			}
 		case <-timeoutTicker.C:
-			// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
-			if _, err := mq.db.Exec(mq.unlockTimeouts); err != nil {
-				logger.Error(err)
-			}
+			mq.onUnlockTimeouts()
 		case <-extendLifeTicker.C:
 			// 正在处理中的rows，每隔一段时间将拿到的锁续命一下，防止被unlockTicker强制解锁
 			processingRows.Range(func(key, value interface{}) bool {
 				var rowId = key.(int64)
-				if _, err := mq.db.Exec(mq.extendLife, rowId); err != nil {
-					logger.Error(err)
-				}
-
+				mq.onExtendLife(rowId)
 				return true
 			})
 		}
@@ -185,7 +179,11 @@ func safeConsume(listener IRowListener, rowId int64) int {
 
 func (mq *MySQLQueue) onDeleteRow(rowId int64, retryCountMap *sync.Map) {
 	retryCountMap.Delete(rowId)
-	if _, err := mq.db.Exec(mq.deleteRow, rowId); err != nil {
+
+	var ctx, cancel = mq.newSQLTimeoutContext()
+	defer cancel()
+
+	if _, err := mq.db.ExecContext(ctx, mq.deleteRow, rowId); err != nil {
 		logger.Error(err)
 	}
 }
@@ -198,20 +196,27 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	// 计算下一次重试的间隔时间
 	var retryInterval = mq.args.RetryInterval(retryCount)
 	var retrySeconds = int64(retryInterval / time.Second)
-	if _, err := mq.db.Exec(mq.unlockRow, retrySeconds, rowId); err != nil {
+
+	var ctx, cancel = mq.newSQLTimeoutContext()
+	defer cancel()
+
+	if _, err := mq.db.ExecContext(ctx, mq.unlockRow, retrySeconds, rowId); err != nil {
 		logger.Error(err)
 	}
 }
 
 func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) ([]rowItem, error) {
-	var tx, err = mq.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	var ctx, cancel = mq.newSQLTimeoutContext()
+	defer cancel()
+
+	var tx, err = mq.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 
 	defer tx.Rollback()
 
-	rows, err := tx.Query(mq.selectForLock)
+	rows, err := tx.QueryContext(ctx, mq.selectForLock)
 	if err != nil {
 		return nil, err
 	}
@@ -236,12 +241,35 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 	}
 
 	var query = fmt.Sprintf(mq.updateForLock, placeholders(len(rowIds)))
-	_, err = tx.Exec(query, rowIds...)
+	_, err = tx.ExecContext(ctx, query, rowIds...)
 	if err != nil {
 		return nil, err
 	}
 
 	return rowItems, tx.Commit()
+}
+
+func (mq *MySQLQueue) onUnlockTimeouts() {
+	var ctx, cancel = mq.newSQLTimeoutContext()
+	defer cancel()
+
+	// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
+	if _, err := mq.db.ExecContext(ctx, mq.unlockTimeouts); err != nil {
+		logger.Error(err)
+	}
+}
+
+func (mq *MySQLQueue) onExtendLife(rowId int64) {
+	var ctx, cancel = mq.newSQLTimeoutContext()
+	defer cancel()
+
+	if _, err := mq.db.ExecContext(ctx, mq.extendLife, rowId); err != nil {
+		logger.Error(err)
+	}
+}
+
+func (mq *MySQLQueue) newSQLTimeoutContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), mq.args.SQLTimeout)
 }
 
 func placeholders(n int) string {
