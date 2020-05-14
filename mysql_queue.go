@@ -89,7 +89,7 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 
 	mq.db.SetPostExecuteHandler(func(ctx *dbi.Context) {
 		if ctx.Err() != nil {
-			logger.Error("err=%s, %q", ctx.Err(), ctx.Text)
+			logger.Error("err=%q, text=%q", ctx.Err(), ctx.Text)
 		}
 	})
 
