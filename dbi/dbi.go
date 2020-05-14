@@ -13,7 +13,8 @@ Copyright (C) - All Rights Reserved
  *********************************************************************/
 
 const (
-	BeginTx = iota
+	None = iota
+	BeginTx
 	QueryContext
 	ExecContext
 	TxQueryContext
@@ -26,10 +27,10 @@ var emptyHandler = func(ctx *Context) {}
 
 type Context struct {
 	context.Context
-	Kind      int
-	Text      string
+	Kind int
+	Text string
 	//StartTime time.Time
-	err       error
+	err error
 }
 
 func (ctx *Context) Err() error {
@@ -58,9 +59,9 @@ func NewDB(db *sql.DB) *DB {
 
 func newContext(ctx context.Context, kind int, text string) *Context {
 	return &Context{
-		Context:   ctx,
-		Kind:      kind,
-		Text:      text,
+		Context: ctx,
+		Kind:    kind,
+		Text:    text,
 		//StartTime: time.Now(),
 	}
 }
