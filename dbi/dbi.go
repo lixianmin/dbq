@@ -3,7 +3,6 @@ package dbi
 import (
 	"context"
 	"database/sql"
-	"time"
 )
 
 /********************************************************************
@@ -29,7 +28,7 @@ type Context struct {
 	context.Context
 	Kind      int
 	Text      string
-	StartTime time.Time
+	//StartTime time.Time
 	err       error
 }
 
@@ -62,7 +61,7 @@ func newContext(ctx context.Context, kind int, text string) *Context {
 		Context:   ctx,
 		Kind:      kind,
 		Text:      text,
-		StartTime: time.Now(),
+		//StartTime: time.Now(),
 	}
 }
 
