@@ -110,6 +110,9 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 }
 
 func (mq *MySQLQueue) goLoop(tableName string, args *MySQLQueueArgs, rowsChan chan rowItem, processingRows *sync.Map) {
+	// 随机sleep一段时间，当有多个MySQLQueue时，避免数据库雪崩
+	RandomSleep(0, args.PollInterval)
+
 	var pollTicker = time.NewTicker(args.PollInterval)
 	var timeoutTicker = time.NewTicker(args.LockTimeout)
 	// 续命的时间间隔，需要小于超时的时间间隔
