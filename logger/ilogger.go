@@ -1,4 +1,4 @@
-package dbq
+package logger
 
 import (
 	"fmt"

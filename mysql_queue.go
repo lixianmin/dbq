@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"github.com/lixianmin/dbq/dbi"
+	"github.com/lixianmin/dbq/logger"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -88,9 +89,10 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 	}
 
 	mq.db.SetPostExecuteHandler(func(ctx *dbi.Context) {
-		var err = ctx.Err()
-		if err != nil && err != sql.ErrTxDone && err != sql.ErrNoRows {
-			logger.Error("err=%q, text=%q", ctx.Err(), ctx.Text)
+		var now = time.Now()
+		var costTime = now.Sub(ctx.StartTime)
+		if costTime > args.SlowSQLWarn {
+			logger.Warn("slow sql found, costTime=%v , text=%q", costTime, ctx.Text)
 		}
 	})
 
@@ -218,24 +220,24 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 
 	var tx, err = mq.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return nil, err
+		return nil, dot(err)
 	}
 
-	defer tx.Rollback()
+	defer dot(tx.Rollback())
 
 	rows, err := tx.QueryContext(ctx, mq.selectForLock)
 	if err != nil {
 		return nil, err
 	}
 
-	defer rows.Close()
+	defer dot(rows.Close())
 
 	// 循环获取id和topic
 	for rows.Next() {
 		var id int64
 		var topic int
 		if err := rows.Scan(&id, &topic); err != nil {
-			return nil, err
+			return nil, dot(err)
 		}
 
 		rowItems = append(rowItems, rowItem{id: id, topic: topic})
@@ -250,10 +252,10 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 	var query = fmt.Sprintf(mq.updateForLock, placeholders(len(rowIds)))
 	_, err = tx.ExecContext(ctx, query, rowIds...)
 	if err != nil {
-		return nil, err
+		return nil, dot(err)
 	}
 
-	return rowItems, tx.Commit()
+	return rowItems, dot(tx.Commit())
 }
 
 func (mq *MySQLQueue) onUnlockTimeouts() {

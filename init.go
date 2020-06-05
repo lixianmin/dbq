@@ -1,5 +1,10 @@
 package dbq
 
+import (
+	"database/sql"
+	"github.com/lixianmin/dbq/logger"
+)
+
 /********************************************************************
 created:    2020-04-25
 author:     lixianmin
@@ -7,14 +12,13 @@ author:     lixianmin
 Copyright (C) - All Rights Reserved
  *********************************************************************/
 
-var logger ILogger = &ConsoleLogger{}
-
-func init() {
-
+func Init(log logger.ILogger) {
+	logger.Init(log)
 }
 
-func Init(log ILogger) {
-	if log != nil {
-		logger = log
+func dot(err error) error {
+	if err != nil && err != sql.ErrTxDone && err != sql.ErrNoRows {
+		logger.GetDefaultLogger().Error("err=%q", err)
 	}
+	return err
 }

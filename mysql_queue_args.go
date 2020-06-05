@@ -13,6 +13,7 @@ type MySQLQueueArgs struct {
 	Concurrency   int                                // 协程并发数，默认10
 	PollInterval  time.Duration                      // 轮询新消息的时间间隔, 默认500ms
 	LockTimeout   time.Duration                      // 锁定超时后，将强制解锁，默认2min
+	SlowSQLWarn   time.Duration                      // 慢sql报警时间，默认1s
 	SQLTimeout    time.Duration                      // sql语句执行超时，默认1min
 	RetryInterval func(retryCount int) time.Duration // 下一次重试的间隔时间，默认每次间隔60秒
 }
@@ -32,6 +33,10 @@ func (args *MySQLQueueArgs) checkFillDefaultArgs() {
 	// 锁定超时后，将强制解锁，默认2min
 	if args.LockTimeout <= 0 {
 		args.LockTimeout = 2 * time.Minute
+	}
+
+	if args.SlowSQLWarn <= 0 {
+		args.SlowSQLWarn = time.Second
 	}
 
 	// sql语句执行超时，默认1min
