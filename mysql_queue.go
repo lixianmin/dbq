@@ -188,7 +188,9 @@ func (mq *MySQLQueue) onDeleteRow(rowId int64, retryCountMap *sync.Map) {
 	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
-	_, _ = mq.db.ExecContext(ctx, mq.deleteRow, rowId)
+	var result, err = mq.db.ExecContext(ctx, mq.deleteRow, rowId)
+	var rowsAffected, _ = result.RowsAffected()
+	logger.Info("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
 }
 
 func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
@@ -203,7 +205,9 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
-	_, _ = mq.db.ExecContext(ctx, mq.unlockRow, retrySeconds, rowId)
+	var result, err = mq.db.ExecContext(ctx, mq.unlockRow, retrySeconds, rowId)
+	var rowsAffected, _ = result.RowsAffected()
+	logger.Info("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
 }
 
 func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) ([]rowItem, error) {
@@ -212,24 +216,24 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 
 	var tx, err = mq.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return nil, dot(err)
+		return nil, err
 	}
 
-	defer dot(tx.Rollback())
+	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx, mq.selectForLock)
 	if err != nil {
 		return nil, err
 	}
 
-	defer dot(rows.Close())
+	defer rows.Close()
 
 	// 循环获取id和topic
 	for rows.Next() {
 		var id int64
 		var topic int
 		if err := rows.Scan(&id, &topic); err != nil {
-			return nil, dot(err)
+			return nil, err
 		}
 
 		rowItems = append(rowItems, rowItem{id: id, topic: topic})
@@ -242,12 +246,16 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 	}
 
 	var query = fmt.Sprintf(mq.updateForLock, placeholders(len(rowIds)))
-	_, err = tx.ExecContext(ctx, query, rowIds...)
+	result, err := tx.ExecContext(ctx, query, rowIds...)
 	if err != nil {
-		return nil, dot(err)
+		return nil, err
 	}
 
-	return rowItems, dot(tx.Commit())
+	err = tx.Commit()
+
+	var rowsAffected, err1 = result.RowsAffected()
+	logger.Info("rowItems=%v, rowsAffected=%d, err=%q", rowItems, rowsAffected, err1)
+	return rowItems, err
 }
 
 func (mq *MySQLQueue) onUnlockTimeouts() {
@@ -255,14 +263,18 @@ func (mq *MySQLQueue) onUnlockTimeouts() {
 	defer cancel()
 
 	// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
-	_, _ = mq.db.ExecContext(ctx, mq.unlockTimeouts)
+	var result, err = mq.db.ExecContext(ctx, mq.unlockTimeouts)
+	var rowsAffected, _ = result.RowsAffected()
+	logger.Info("rowsAffected=%d, err=%q", rowsAffected, err)
 }
 
 func (mq *MySQLQueue) onExtendLife(rowId int64) {
 	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
-	_, _ = mq.db.ExecContext(ctx, mq.extendLife, rowId)
+	var result, err = mq.db.ExecContext(ctx, mq.extendLife, rowId)
+	var rowsAffected, _ = result.RowsAffected()
+	logger.Info("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
 }
 
 func (mq *MySQLQueue) newTimeoutContext() (*dbi.Context, context.CancelFunc) {
