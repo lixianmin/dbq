@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/lixianmin/dbq/dbi"
+	"github.com/lixianmin/dbi"
 	"github.com/lixianmin/dbq/logger"
 	"runtime/debug"
 	"strconv"
@@ -87,14 +87,6 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 		// 但第3次调用后retry=0，因此虽然设置了下次重试时间，但不会进行重试了。除非手动设置retry字段的值
 		unlockRow: fmt.Sprintf("update %s set locked = 0, update_time = date_add(now(), interval ? second) where id = ?;", tableName),
 	}
-
-	mq.db.SetPostExecuteHandler(func(ctx *dbi.Context) {
-		var now = time.Now()
-		var costTime = now.Sub(ctx.StartTime)
-		if costTime > args.SlowSQLWarn {
-			logger.Warn("slow sql found, costTime=%v , text=%q", costTime, ctx.Text)
-		}
-	})
 
 	var rowsChan = make(chan rowItem, concurrency)
 	var processingRows = &sync.Map{}
@@ -193,7 +185,7 @@ func safeConsume(listener IRowListener, rowId int64) int {
 func (mq *MySQLQueue) onDeleteRow(rowId int64, retryCountMap *sync.Map) {
 	retryCountMap.Delete(rowId)
 
-	var ctx, cancel = mq.newSQLTimeoutContext()
+	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
 	_, _ = mq.db.ExecContext(ctx, mq.deleteRow, rowId)
@@ -208,14 +200,14 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	var retryInterval = mq.args.RetryInterval(retryCount)
 	var retrySeconds = int64(retryInterval / time.Second)
 
-	var ctx, cancel = mq.newSQLTimeoutContext()
+	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
 	_, _ = mq.db.ExecContext(ctx, mq.unlockRow, retrySeconds, rowId)
 }
 
 func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) ([]rowItem, error) {
-	var ctx, cancel = mq.newSQLTimeoutContext()
+	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
 	var tx, err = mq.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -259,7 +251,7 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 }
 
 func (mq *MySQLQueue) onUnlockTimeouts() {
-	var ctx, cancel = mq.newSQLTimeoutContext()
+	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
 	// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
@@ -267,14 +259,32 @@ func (mq *MySQLQueue) onUnlockTimeouts() {
 }
 
 func (mq *MySQLQueue) onExtendLife(rowId int64) {
-	var ctx, cancel = mq.newSQLTimeoutContext()
+	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
 	_, _ = mq.db.ExecContext(ctx, mq.extendLife, rowId)
 }
 
-func (mq *MySQLQueue) newSQLTimeoutContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), mq.args.SQLTimeout)
+func (mq *MySQLQueue) newTimeoutContext() (*dbi.Context, context.CancelFunc) {
+	var startTime = time.Now()
+	var ctxTimeout, cancel = context.WithTimeout(context.Background(), mq.args.SQLTimeout)
+	var ctx = dbi.NewContext(ctxTimeout, dbi.ContextArgs{ErrorFilter: func(err error) error {
+		var endTime = time.Now()
+		var costTime = endTime.Sub(startTime)
+		if costTime > mq.args.SlowSQLWarn {
+			logger.Warn("slow sql found, costTime=%v", costTime)
+		}
+
+		switch err {
+		case nil, sql.ErrNoRows, sql.ErrTxDone:
+		default:
+			logger.Error("mysql error, err=%q", err)
+		}
+
+		return err
+	}})
+
+	return ctx, cancel
 }
 
 func placeholders(n int) string {
