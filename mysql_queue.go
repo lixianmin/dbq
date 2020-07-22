@@ -167,6 +167,9 @@ func (mq *MySQLQueue) goProcess(listeners RowListeners, rowsChan chan rowItem, p
 				mq.onDeleteRow(rowId, retryCountMap)
 			case ReconsumeLater:
 				mq.onUnlockRow(rowId, retryCountMap)
+			default:
+				var message = fmt.Sprintf("invalid action = %d", action)
+				panic(message)
 			}
 		}
 	}
@@ -190,7 +193,7 @@ func (mq *MySQLQueue) onDeleteRow(rowId int64, retryCountMap *sync.Map) {
 
 	var result, err = mq.db.ExecContext(ctx, mq.deleteRow, rowId)
 	var rowsAffected, _ = result.RowsAffected()
-	logger.Info("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
+	logger.Debug("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
 }
 
 func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
@@ -207,7 +210,7 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 
 	var result, err = mq.db.ExecContext(ctx, mq.unlockRow, retrySeconds, rowId)
 	var rowsAffected, _ = result.RowsAffected()
-	logger.Info("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
+	logger.Debug("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
 }
 
 func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) ([]rowItem, error) {
@@ -254,7 +257,7 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 	err = tx.Commit()
 
 	var rowsAffected, err1 = result.RowsAffected()
-	logger.Info("rowItems=%v, rowsAffected=%d, err=%q", rowItems, rowsAffected, err1)
+	logger.Debug("rowItems=%v, rowsAffected=%d, err=%q", rowItems, rowsAffected, err1)
 	return rowItems, err
 }
 
@@ -265,7 +268,7 @@ func (mq *MySQLQueue) onUnlockTimeouts() {
 	// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
 	var result, err = mq.db.ExecContext(ctx, mq.unlockTimeouts)
 	var rowsAffected, _ = result.RowsAffected()
-	logger.Info("rowsAffected=%d, err=%q", rowsAffected, err)
+	logger.Debug("rowsAffected=%d, err=%q", rowsAffected, err)
 }
 
 func (mq *MySQLQueue) onExtendLife(rowId int64) {
@@ -274,7 +277,7 @@ func (mq *MySQLQueue) onExtendLife(rowId int64) {
 
 	var result, err = mq.db.ExecContext(ctx, mq.extendLife, rowId)
 	var rowsAffected, _ = result.RowsAffected()
-	logger.Info("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
+	logger.Debug("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
 }
 
 func (mq *MySQLQueue) newTimeoutContext() (*dbi.Context, context.CancelFunc) {
