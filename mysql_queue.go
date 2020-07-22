@@ -118,7 +118,7 @@ func (mq *MySQLQueue) goLoop(tableName string, args *MySQLQueueArgs, rowsChan ch
 	var pollTicker = time.NewTicker(args.PollInterval)
 	var timeoutTicker = time.NewTicker(args.LockTimeout)
 	// 续命的时间间隔，需要小于超时的时间间隔
-	var extendLifeTicker = time.NewTicker(args.LockTimeout / 2)
+	var extendLifeTicker = time.NewTicker(args.LockTimeout / 4)
 
 	defer func() {
 		pollTicker.Stop()
