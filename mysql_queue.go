@@ -126,7 +126,14 @@ func (mq *MySQLQueue) goLoop(later loom.Later, tableName string, args *MySQLQueu
 			rowItems, err := mq.lockForProcess(rowItems[:0], rowIds[:0])
 			if err == nil {
 				for i := 0; i < len(rowItems); i++ {
-					rowsChan <- rowItems[i]
+					var item = rowItems[i]
+					// 为什么将rowId存储到processingRows的方法提取到这里？原因是在goProcess()的处理过程中，处理时候可能非常长，此时
+					// 新一轮的lockForProcess()会加入新的rowItem到rowsChan中，在原来的方案中，由于goProcess()迟迟处理不完，会导致
+					// processingRows中不会加入新的rowId。这样，在extendLifeTicker中就不会将这些新的已经加锁的任务续命。进一步导致
+					// onUnlockTimeouts()方法会解锁这个新加入的任务。这样，就意味着在多机部署的情况下，可能会有多个进程靠后拿到了对应
+					// 的rowId，从而导致同一个rowId被多次处理。
+					processingRows.Store(item.id, nil)
+					rowsChan <- item
 				}
 			} else {
 				logger.Error(err)
@@ -155,7 +162,7 @@ func (mq *MySQLQueue) goProcess(listeners RowListeners, rowsChan chan rowItem, p
 			}
 
 			var rowId = row.id
-			processingRows.Store(rowId, nil)
+			//processingRows.Store(rowId, nil)
 			var action = safeConsume(listener, rowId)
 			processingRows.Delete(rowId)
 
