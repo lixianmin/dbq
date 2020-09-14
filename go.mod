@@ -4,6 +4,6 @@ go 1.13
 
 require (
 	github.com/go-sql-driver/mysql v1.5.0
-	github.com/lixianmin/dbi v0.0.0-20200722033233-f5f1f8108e1a
-	github.com/lixianmin/logo v0.0.0-20200617032249-3977c614e2a4
+	github.com/lixianmin/dbi v0.0.0-20200807051936-ab86e6712856
+	github.com/lixianmin/logo v0.0.0-20200911153704-6009b7eee0d1
 )
