@@ -122,21 +122,27 @@ func (mq *MySQLQueue) goLoop(later loom.Later, tableName string, args *MySQLQueu
 	for {
 		select {
 		case <-pollTicker.C:
-			// 每次都要重置rowItems与rowIds
-			rowItems, err := mq.lockForProcess(rowItems[:0], rowIds[:0])
-			if err == nil {
-				for i := 0; i < len(rowItems); i++ {
-					var item = rowItems[i]
-					// 为什么将rowId存储到processingRows的方法提取到这里？原因是在goProcess()的处理过程中，处理时候可能非常长，此时
-					// 新一轮的lockForProcess()会加入新的rowItem到rowsChan中，在原来的方案中，由于goProcess()迟迟处理不完，会导致
-					// processingRows中不会加入新的rowId。这样，在extendLifeTicker中就不会将这些新的已经加锁的任务续命。进一步导致
-					// onUnlockTimeouts()方法会解锁这个新加入的任务。这样，就意味着在多机部署的情况下，可能会有多个进程靠后拿到了对应
-					// 的rowId，从而导致同一个rowId被多次处理。
-					processingRows.Store(item.id, nil)
-					rowsChan <- item
+			// cap(rowsChan)跟goProcess的数据一样都是concurrency，但是goLoop()调用频率可能会更高一些，而goProcess()的处理速度可能
+			// 会非常慢。只所有做这个len(rowsChan)==0的限制，一是为了在处理能力有限的情况下不要锁定太多的行，二是为了不会卡死goLoop()
+			// 这个goroutine。否则，如果卡死了很长时间，当rowsChan <- item 恢复执行后， onUnlockTimeouts()有可能先于onExtendLife()
+			// 执行，从而导致意外解锁已经加入到了rowsChan中的数据行。
+			if len(rowsChan) == 0 {
+				// 每次都要重置rowItems与rowIds
+				rowItems, err := mq.lockForProcess(rowItems[:0], rowIds[:0])
+				if err == nil {
+					for i := 0; i < len(rowItems); i++ {
+						var item = rowItems[i]
+						// 为什么将rowId存储到processingRows的方法提取到这里？原因是在goProcess()的处理过程中，处理时候可能非常长，此时
+						// 新一轮的lockForProcess()会加入新的rowItem到rowsChan中，在原来的方案中，由于goProcess()迟迟处理不完，会导致
+						// processingRows中不会加入新的rowId。这样，在extendLifeTicker中就不会将这些新的已经加锁的任务续命。进一步导致
+						// onUnlockTimeouts()方法会解锁这个新加入的任务。这样，就意味着在多机部署的情况下，可能会有多个进程靠后拿到了对应
+						// 的rowId，从而导致同一个rowId被多次处理。
+						processingRows.Store(item.id, nil)
+						rowsChan <- item
+					}
+				} else {
+					logger.Error(err)
 				}
-			} else {
-				logger.Error(err)
 			}
 		case <-timeoutTicker.C:
 			mq.onUnlockTimeouts()
