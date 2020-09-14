@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/lixianmin/dbi"
 	"github.com/lixianmin/dbq/logger"
+	"github.com/lixianmin/got/loom"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -93,7 +94,9 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 	var retryCountMap = &sync.Map{}
 
 	// 主循环
-	go mq.goLoop(tableName, args, rowsChan, processingRows)
+	loom.Go(func(later loom.Later) {
+		mq.goLoop(later, tableName, args, rowsChan, processingRows)
+	})
 
 	// concurrency个任务处理协程
 	for i := 0; i < concurrency; i++ {
@@ -103,20 +106,14 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 	return mq
 }
 
-func (mq *MySQLQueue) goLoop(tableName string, args *MySQLQueueArgs, rowsChan chan rowItem, processingRows *sync.Map) {
+func (mq *MySQLQueue) goLoop(later loom.Later, tableName string, args *MySQLQueueArgs, rowsChan chan rowItem, processingRows *sync.Map) {
 	// 随机sleep一段时间，当有多个MySQLQueue时，避免数据库雪崩
 	RandomSleep(0, args.PollInterval)
 
-	var pollTicker = time.NewTicker(args.PollInterval)
-	var timeoutTicker = time.NewTicker(args.LockTimeout)
+	var pollTicker = later.NewTicker(args.PollInterval)
+	var timeoutTicker = later.NewTicker(args.LockTimeout)
 	// 续命的时间间隔，需要小于超时的时间间隔
-	var extendLifeTicker = time.NewTicker(args.LockTimeout / 4)
-
-	defer func() {
-		pollTicker.Stop()
-		timeoutTicker.Stop()
-		extendLifeTicker.Stop()
-	}()
+	var extendLifeTicker = later.NewTicker(args.LockTimeout / 4)
 
 	var concurrency = cap(rowsChan)
 	var rowItems = make([]rowItem, 0, concurrency)
@@ -192,8 +189,7 @@ func (mq *MySQLQueue) onDeleteRow(rowId int64, retryCountMap *sync.Map) {
 	defer cancel()
 
 	var result, err = mq.db.ExecContext(ctx, mq.deleteRow, rowId)
-	var rowsAffected, _ = result.RowsAffected()
-	logger.Debug("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
+	printResult("[onDeleteRow()] rowId="+strconv.FormatInt(rowId, 10), result, err)
 }
 
 func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
@@ -209,8 +205,7 @@ func (mq *MySQLQueue) onUnlockRow(rowId int64, retryCountMap *sync.Map) {
 	defer cancel()
 
 	var result, err = mq.db.ExecContext(ctx, mq.unlockRow, retrySeconds, rowId)
-	var rowsAffected, _ = result.RowsAffected()
-	logger.Debug("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
+	printResult("[onUnlockRow()] rowId="+strconv.FormatInt(rowId, 10), result, err)
 }
 
 func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) ([]rowItem, error) {
@@ -257,7 +252,7 @@ func (mq *MySQLQueue) lockForProcess(rowItems []rowItem, rowIds []interface{}) (
 	err = tx.Commit()
 
 	var rowsAffected, err1 = result.RowsAffected()
-	logger.Debug("rowItems=%v, rowsAffected=%d, err=%q", rowItems, rowsAffected, err1)
+	logger.Debug("[lockForProcess()] rowItems=%v, rowsAffected=%d, err=%q", rowItems, rowsAffected, err1)
 	return rowItems, err
 }
 
@@ -267,8 +262,7 @@ func (mq *MySQLQueue) onUnlockTimeouts() {
 
 	// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
 	var result, err = mq.db.ExecContext(ctx, mq.unlockTimeouts)
-	var rowsAffected, _ = result.RowsAffected()
-	logger.Debug("rowsAffected=%d, err=%q", rowsAffected, err)
+	printResult("[onUnlockTimeouts()]", result, err)
 }
 
 func (mq *MySQLQueue) onExtendLife(rowId int64) {
@@ -276,8 +270,7 @@ func (mq *MySQLQueue) onExtendLife(rowId int64) {
 	defer cancel()
 
 	var result, err = mq.db.ExecContext(ctx, mq.extendLife, rowId)
-	var rowsAffected, _ = result.RowsAffected()
-	logger.Debug("rowId=%d, rowsAffected=%d, err=%q", rowId, rowsAffected, err)
+	printResult("[onExtendLife()] rowId="+strconv.FormatInt(rowId, 10), result, err)
 }
 
 func (mq *MySQLQueue) newTimeoutContext() (*dbi.Context, context.CancelFunc) {
@@ -300,6 +293,16 @@ func (mq *MySQLQueue) newTimeoutContext() (*dbi.Context, context.CancelFunc) {
 	}})
 
 	return ctx, cancel
+}
+
+func printResult(title string, result sql.Result, err error) {
+	if err != nil {
+		logger.Debug("%s err=%q", title, err)
+		return
+	}
+
+	var rowsAffected, _ = result.RowsAffected()
+	logger.Debug("%s rowsAffected=%d", title, rowsAffected)
 }
 
 func placeholders(n int) string {
