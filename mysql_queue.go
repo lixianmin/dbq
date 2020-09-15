@@ -43,6 +43,7 @@ type MySQLQueue struct {
 	updateForLock  string
 	extendLife     string
 	unlockTimeouts string
+	selectTimeouts string
 	deleteRow      string
 	unlockRow      string
 }
@@ -51,6 +52,11 @@ type MySQLQueue struct {
 type rowItem struct {
 	id    int64
 	topic int
+}
+
+type timeoutRow struct {
+	Id         int64     `db:"id"`
+	UpdateTime time.Time `db:"update_time"`
 }
 
 // map<topic, listener> 消息处理器map，每一个topic对应一种listener对象
@@ -81,6 +87,7 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 		updateForLock:  fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where id in (%%s);", tableName),
 		extendLife:     fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
 		unlockTimeouts: fmt.Sprintf("update %s set locked = 0 where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, topicString),
+		selectTimeouts: fmt.Sprintf("select id, update_time from %s where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128 for update;", tableName, topicString),
 		deleteRow:      fmt.Sprintf("delete from %s where id = ?;", tableName),
 
 		// 解锁的时候，利用 update_time 把重试时间设置到 ? seconds 之后
@@ -273,9 +280,29 @@ func (mq *MySQLQueue) onUnlockTimeouts() {
 	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
-	// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
-	var result, err = mq.db.ExecContext(ctx, mq.unlockTimeouts)
-	printResult("[onUnlockTimeouts()]", result, err)
+	//// 某些row在处理过程，进程会意外重启，因此会处于中间状态。这些row在超时后会被强制解锁，从而有机会重新处理
+	//var result, err = mq.db.ExecContext(ctx, mq.unlockTimeouts)
+	//printResult("[onUnlockTimeouts()]", result, err)
+
+	var tx, err = mq.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		logger.Info("[onUnlockTimeouts(1)] err = %q", err)
+		return
+	}
+	defer tx.Rollback()
+
+	var rows []timeoutRow
+	err = tx.SelectContext(ctx, &rows, mq.selectTimeouts)
+	if err != nil {
+		logger.Info("[onUnlockTimeouts(2)] err = %q", err)
+		return
+	}
+
+	result, err := tx.ExecContext(ctx, mq.unlockTimeouts)
+	printResult(fmt.Sprintf("[onUnlockTimeouts()] rows=%+v", rows), result, err)
+	if err == nil {
+		_ = tx.Commit()
+	}
 }
 
 func (mq *MySQLQueue) onExtendLife(rowId int64) {
