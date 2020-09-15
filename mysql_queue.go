@@ -41,7 +41,7 @@ type MySQLQueue struct {
 
 	selectForLock  string
 	updateForLock  string
-	extendLife     string
+	heartbeat      string
 	unlockTimeouts string
 	selectTimeouts string
 	deleteRow      string
@@ -85,9 +85,9 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 
 		selectForLock:  fmt.Sprintf("select id, topic from %s where locked = 0 and topic in (%s) and retry > 0 and now() > update_time limit %d for update;", tableName, topicString, concurrency),
 		updateForLock:  fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where id in (%%s);", tableName),
-		extendLife:     fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
-		unlockTimeouts: fmt.Sprintf("update %s set locked = 0 where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128;", tableName, topicString),
-		selectTimeouts: fmt.Sprintf("select id, update_time from %s where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval 60 second) limit 128 for update;", tableName, topicString),
+		heartbeat:      fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
+		unlockTimeouts: fmt.Sprintf("update %s set locked = 0 where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval %d second) limit 128;", tableName, topicString, int(args.LockTimeout.Seconds())),
+		selectTimeouts: fmt.Sprintf("select id, update_time from %s where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval %d second) limit 128 for update;", tableName, topicString, int(args.LockTimeout.Seconds())),
 		deleteRow:      fmt.Sprintf("delete from %s where id = ?;", tableName),
 
 		// 解锁的时候，利用 update_time 把重试时间设置到 ? seconds 之后
@@ -120,7 +120,8 @@ func (mq *MySQLQueue) goLoop(later loom.Later, tableName string, args *MySQLQueu
 	var pollTicker = later.NewTicker(args.PollInterval)
 	var timeoutTicker = later.NewTicker(args.LockTimeout)
 	// 续命的时间间隔，需要小于超时的时间间隔
-	var extendLifeTicker = later.NewTicker(args.LockTimeout / 4)
+	var heartbeatInterval = (args.LockTimeout - 1) >> 2
+	var heartbeatTicker = later.NewTicker(heartbeatInterval)
 
 	var concurrency = cap(rowsChan)
 	var rowItems = make([]rowItem, 0, concurrency)
@@ -153,11 +154,11 @@ func (mq *MySQLQueue) goLoop(later loom.Later, tableName string, args *MySQLQueu
 			}
 		case <-timeoutTicker.C:
 			mq.onUnlockTimeouts()
-		case <-extendLifeTicker.C:
+		case <-heartbeatTicker.C:
 			// 正在处理中的rows，每隔一段时间将拿到的锁续命一下，防止被unlockTicker强制解锁
 			processingRows.Range(func(key, value interface{}) bool {
 				var rowId = key.(int64)
-				mq.onExtendLife(rowId)
+				mq.onHeartbeat(rowId)
 				return true
 			})
 		}
@@ -305,12 +306,12 @@ func (mq *MySQLQueue) onUnlockTimeouts() {
 	}
 }
 
-func (mq *MySQLQueue) onExtendLife(rowId int64) {
+func (mq *MySQLQueue) onHeartbeat(rowId int64) {
 	var ctx, cancel = mq.newTimeoutContext()
 	defer cancel()
 
-	var result, err = mq.db.ExecContext(ctx, mq.extendLife, rowId)
-	printResult("[onExtendLife()] rowId="+strconv.FormatInt(rowId, 10), result, err)
+	var result, err = mq.db.ExecContext(ctx, mq.heartbeat, rowId)
+	printResult("[onHeartbeat()] rowId="+strconv.FormatInt(rowId, 10), result, err)
 }
 
 func (mq *MySQLQueue) newTimeoutContext() (*dbi.Context, context.CancelFunc) {
