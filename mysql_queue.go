@@ -55,8 +55,8 @@ type rowItem struct {
 }
 
 type timeoutRow struct {
-	Id         int64     `db:"id"`
-	UpdateTime time.Time `db:"update_time"`
+	Id         int64  `db:"id"`
+	UpdateTime string `db:"update_time"`
 }
 
 // map<topic, listener> 消息处理器map，每一个topic对应一种listener对象
