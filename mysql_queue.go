@@ -83,7 +83,7 @@ func NewMySQLQueue(db *sql.DB, tableName string, listeners RowListeners, args *M
 		db:   dbi.NewDB(db),
 		args: args,
 
-		selectForLock:  fmt.Sprintf("select id, topic from %s where locked = 0 and topic in (%s) and retry > 0 and now() > update_time limit %d for update;", tableName, topicString, concurrency),
+		selectForLock:  fmt.Sprintf("select id, topic from %s where locked = 0 and topic in (%s) and retry > 0 and now() > update_time order by id limit %d for update;", tableName, topicString, concurrency),
 		updateForLock:  fmt.Sprintf("update %s set locked = 1, retry = retry - 1 where id in (%%s);", tableName),
 		heartbeat:      fmt.Sprintf("update %s set update_time = now() where id = ?;", tableName),
 		unlockTimeouts: fmt.Sprintf("update %s set locked = 0 where locked = 1 and topic in (%s) and retry > 0 and now() > date_add(update_time, interval %d second) limit 128;", tableName, topicString, int(args.LockTimeout.Seconds())),
